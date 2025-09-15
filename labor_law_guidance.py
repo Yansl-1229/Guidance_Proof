@@ -350,7 +350,15 @@ class LaborLawGuidance:
         user_input = input("\n您的回答：").strip()
         
         # 解析用户输入，匹配证据类型
-        user_evidence = self._parse_user_evidence_input(user_input, evidence_list)
+        # 解析用户输入，匹配证据类型
+        # 原有规则解析
+        rule_parsed = self._parse_user_evidence_input(user_input, evidence_list)
+        # 补充：调用LLM解析并与规则结果合并（LLM识别优先）
+        try:
+            llm_parsed = self._parse_user_evidence_with_llm(user_input, evidence_list)
+        except Exception:
+            llm_parsed = {}
+        user_evidence = {**rule_parsed, **llm_parsed}
         
         # 第二轮对话：律师确认并分析现有证据，提供缺失证据的取证建议
         print("\n" + "=" * 60)
@@ -396,7 +404,7 @@ class LaborLawGuidance:
         print("\n律师：以上是基于您案件情况的专业建议，建议优先收集关键证据以提高维权成功率。")
         
         return user_evidence
-    
+
     def _parse_user_evidence_input(self, user_input: str, evidence_list: List[Dict]) -> Dict:
         """解析用户输入的证据材料，仅从用户输入中提取其“已持有/部分持有”的证据。
         - 仅返回用户声称持有（完整或部分）的证据项；不为未提及或明确否定的证据填充“否”，
@@ -409,7 +417,7 @@ class LaborLawGuidance:
             return result
 
         # 将输入拆分为若干语句，便于就近判断否定/部分/肯定语义
-        seps = "，,。.;；!！?？\n"
+        seps = "，,。.;；!！？？\n"
         sentences: List[str] = []
         buf = ""
         for ch in text:
@@ -513,7 +521,92 @@ class LaborLawGuidance:
                 }
 
         return result
-    
+
+    def _parse_user_evidence_with_llm(self, user_input: str, evidence_list: List[Dict]) -> Dict:
+        """使用Qwen对用户输入进行解析，识别其声称“已持有/部分持有”的证据，仅在候选清单内选择。
+        返回格式与规则解析一致：{ evidence_type: {status: '是'|'部分', evidence_info: Dict, details: str} }
+        """
+        text = (user_input or "").strip()
+        if not text:
+            return {}
+        # 构建候选证据名称列表
+        name_to_item = {}
+        names = []
+        for e in evidence_list:
+            et = (e.get("evidence_type") or "").strip()
+            if et and et not in name_to_item:
+                name_to_item[et] = e
+                names.append(et)
+        if not names:
+            return {}
+
+        system_prompt = (
+            "你是资深劳动法律师助理。任务：根据用户的自由文本，识别其‘已持有/部分持有’的证据。\n"
+            "严格要求：\n"
+            "1) 只能从我给出的候选证据类型中选择；\n"
+            "2) 仅返回用户明确表示‘持有’或‘部分持有’的证据；对于未提及或明确否定的证据，不要返回；\n"
+            "3) 输出一个JSON对象（不要任何其他文字），键为evidence_type（必须与候选完全一致），值为对象：{\"status\": \"是\"|\"部分\", \"justification\": \"直接摘录或概括用户原话\"}。\n"
+            "4) 若用户表述模糊但倾向于持有，默认归为‘是’；如明确为部分（如只有复印件/截图/部分月份），标注‘部分’。\n"
+        )
+        user_msg = (
+            f"候选证据类型：{json.dumps(names, ensure_ascii=False)}\n"
+            f"用户输入：{text}"
+        )
+
+        try:
+            completion = self.client.chat.completions.create(
+                model="qwen-max-latest",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_msg},
+                ],
+                temperature=0.1,
+                response_format={"type": "json_object"}
+            )
+            result_text = completion.choices[0].message.content
+        except Exception:
+            completion = self.client.chat.completions.create(
+                model="qwen-max-latest",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_msg},
+                ],
+                temperature=0.1
+            )
+            result_text = completion.choices[0].message.content
+
+        # 解析模型返回
+        parsed = None
+        try:
+            parsed = json.loads(result_text)
+        except Exception:
+            # 简易兜底：截取第一个'{'到最后一个'}'
+            start = result_text.find('{')
+            end = result_text.rfind('}')
+            if start != -1 and end > start:
+                try:
+                    parsed = json.loads(result_text[start:end+1])
+                except Exception:
+                    parsed = None
+        if not isinstance(parsed, dict):
+            return {}
+
+        result: Dict[str, Dict] = {}
+        for k, v in parsed.items():
+            if k not in name_to_item:
+                continue
+            status_raw = (v.get("status") if isinstance(v, dict) else None) or ""
+            status = "部分" if "部分" in status_raw else ("是" if "是" in status_raw or status_raw.strip()=="" else None)
+            if not status:
+                continue
+            details = "LLM识别：" + ((v.get("justification") or v.get("reason") or "").strip() if isinstance(v, dict) else "")
+            result[k] = {
+                "status": status,
+                "evidence_info": name_to_item[k],
+                "details": details.strip()
+            }
+        return result
+
     def _analyze_evidence_key_points(self, evidence_type: str, evidence_info: Dict) -> str:
         """分析证据的关键要点"""
         try:
